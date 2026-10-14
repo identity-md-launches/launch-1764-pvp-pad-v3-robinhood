@@ -165,12 +165,14 @@ contract LiquidityV4Test is BaseTest {
         assertApproxEqAbs(players[8].balance - before, 0.04 ether, 1e10, "healthy pool paid plus old bid refund");
         vm.clearMockedCalls();
         uint256 newBefore = players[9].balance;
+        uint256 oldBefore = players[8].balance;
         assertTrue(liq.retryPool(0));
         assertEq(liq.getPool(0).failures, 0);
-        assertGe(players[9].balance - newBefore, 0.02 ether - 10, "failed pool remains collectible");
+        assertGe(players[8].balance - oldBefore, 0.02 ether - 10, "failed pool stays owed to the king of its reign");
+        assertEq(players[9].balance, newBefore);
     }
 
-    function test_crownPrecollectsSixteenOfEighteenPools() public {
+    function test_crownPrecollectsAllEighteenPools() public {
         graduatePvp();
         vm.pauseGasMetering();
         for (uint256 i; i < 17; ++i) {
@@ -186,12 +188,14 @@ contract LiquidityV4Test is BaseTest {
         vm.warp(king.challengeOpensAt());
         vm.resumeGasMetering();
         vm.recordLogs();
+        uint256 oldBefore = players[8].balance;
         uint256 start = gasleft();
         vm.prank(players[9]);
         king.takeCrown{value: 0.011 ether}();
         uint256 used = start - gasleft();
         emit log_named_uint("takeCrown gas, eighteen real pools", used);
         assertLt(used, 8_000_000);
+        assertApproxEqAbs(players[8].balance - oldBefore, 0.028 ether, 18, "refund plus all eighteen pools");
         Vm.Log[] memory logs = vm.getRecordedLogs();
         uint256 collectedBefore;
         uint256 collectedAfter;
@@ -209,8 +213,8 @@ contract LiquidityV4Test is BaseTest {
                 else ++collectedBefore;
             }
         }
-        assertEq(collectedBefore, 16);
-        assertEq(collectedAfter, 2, "normal upkeep follows crowning");
+        assertEq(collectedBefore, 18, "the whole walk fits the stipend");
+        assertEq(collectedAfter, 2, "normal upkeep follows crowning and finds nothing of the old reign");
         uint256 cursor = liq.distributeCursor();
         liq.distribute(type(uint256).max);
         assertEq(liq.distributeCursor() % 18, (cursor + 16) % 18, "public distribute is bounded too");

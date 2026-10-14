@@ -12,6 +12,8 @@ interface IPadFund {
 /// @notice Crown auction. Opens after PvP graduates. Last contract in the manifest: its constructor
 /// binds to the pad and PadLiquidity; opening the pad later creates genesis.
 contract KingOfThePad {
+    /// @notice Minimum settlement stipend a bid must carry. Everything the bidder supplies beyond the
+    /// outer reserve is forwarded, so more pools settle when more gas is sent.
     uint256 public constant CROWN_DISTRIBUTE_GAS = 5_000_000;
     uint256 public constant MIN_BID = 0.01 ether;
     uint256 public constant HOLD = 1 hours;
@@ -69,11 +71,13 @@ contract KingOfThePad {
             require(msg.value >= previousBid * STEP_BPS / 10_000, "bid too low");
             extra = msg.value - previousBid;
         }
-        // Forward the full stipend despite EIP-150, leaving enough for refunds and the split.
-        // Every unflagged pool in this batch must settle; errors (including OOG) abort the bid.
+        // Forward at least the minimum stipend despite EIP-150, and every unit of gas the bidder
+        // supplied beyond the outer reserve, so the settlement covers as many pools as the bid pays
+        // for. Every unflagged pool it reaches must settle; errors (including OOG) abort the bid.
         if (previous != address(0)) {
-            require(gasleft() >= CROWN_DISTRIBUTE_GAS + CROWN_DISTRIBUTE_GAS / 63 + CROWN_RESERVE_GAS, "settlement gas");
-            liquidity.settleCrown{gas: CROWN_DISTRIBUTE_GAS}();
+            uint256 available = gasleft();
+            require(available >= CROWN_DISTRIBUTE_GAS + CROWN_DISTRIBUTE_GAS / 63 + CROWN_RESERVE_GAS, "settlement gas");
+            liquidity.settleCrown{gas: available - CROWN_RESERVE_GAS}();
         }
         king = msg.sender;
         bid = msg.value;
@@ -98,7 +102,8 @@ contract KingOfThePad {
         pad.upkeepFor(msg.sender); // upkeep fees (finalizer) go to the bidder, not to this contract
     }
 
-    /// @notice Collect LP fees in kind from at most 16 of the next n graduated pools and pay the current king.
+    /// @notice Collect LP fees in kind from at most 16 of the next n graduated pools and pay the king
+    /// each pool is owed to (the current king, or an earlier one whose reign the pool was never settled for).
     function distribute(uint256 n) external {
         liquidity.distribute(n);
     }

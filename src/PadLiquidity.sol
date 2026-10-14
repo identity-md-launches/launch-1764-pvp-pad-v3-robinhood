@@ -25,27 +25,30 @@ interface IKingView {
 /// hooks = PadHook), owns the full-range LP forever, collects its fees for the king, and buys and
 /// burns PvP with the burn bucket. All v4 interaction goes through PoolManager.unlock with own funds.
 contract PadLiquidity is IUnlockCallback {
-    uint24 public constant FEE = 10_000;
-    int24 public constant TICK_SPACING = 200;
-    int24 public constant MIN_TICK = -887_200;
-    int24 public constant MAX_TICK = 887_200;
+    uint24 internal constant FEE = 10_000;
+    int24 internal constant TICK_SPACING = 200;
+    int24 internal constant MIN_TICK = -887_200;
+    int24 internal constant MAX_TICK = 887_200;
     // TickMath.getSqrtPriceAtTick(-887200) and (887200) of v4-core v4.0.0; asserted in LiquidityV4.t.sol.
     uint160 public constant SQRT_MIN_FULL = 4_310_618_292;
     uint160 public constant SQRT_MAX_FULL = 1_456_195_216_270_955_103_206_513_029_158_776_779_468_408_838_535;
     uint160 internal constant MIN_SQRT_PRICE_LIMIT = 4_295_128_740;
     uint256 internal constant Q96 = 1 << 96;
-    address public constant DEAD = 0x000000000000000000000000000000000000dEaD;
-    uint256 public constant BURN_MAX = 0.02 ether;
-    uint256 public constant BURN_INTERVAL = 10 minutes;
-    uint256 public constant COLLECT_GAS = 300_000;
-    uint256 public constant MAX_DISTRIBUTE_POOLS = 16;
+    address internal constant DEAD = 0x000000000000000000000000000000000000dEaD;
+    uint256 internal constant BURN_MAX = 0.02 ether;
+    uint256 internal constant BURN_INTERVAL = 10 minutes;
+    uint256 internal constant COLLECT_GAS = 300_000;
+    /// @notice Public `distribute` examines at most this many pools per call.
+    uint256 internal constant MAX_DISTRIBUTE_POOLS = 16;
+    /// @dev A pre-crown settlement walks every pool while gas fits and must reach at least this many.
+    uint256 internal constant MIN_CROWN_POOLS = 16;
     uint256 internal constant COLLECTION_RESERVE_GAS = 100_000;
     uint256 internal constant BROKEN_FAILURES = 3;
     uint256 internal constant LIQUIDITY_MARGIN_PPM = 1_000_000;
     /// @notice Each burn buy is limited to this sqrt-price move from the
     /// pre-swap spot: 0.5% in sqrt price, about 1% in price. Unfilled input stays for a later chunk.
     /// This bounds per-call impact; it is not a general guarantee against MEV or spot manipulation.
-    uint256 public constant IMPACT_BPS = 50;
+    uint256 internal constant IMPACT_BPS = 50;
     bytes32 internal constant POOLS_SLOT = bytes32(uint256(6));
 
     uint8 internal constant ACT_ADD = 1;
@@ -56,6 +59,10 @@ contract PadLiquidity is IUnlockCallback {
         uint256 launchId;
         address token;
         uint128 liquidity;
+        /// @dev Reign the pool's fees are settled for (see `reign`). Below the current reign, the pool
+        /// still holds fees of an earlier reign and its next collection pays that reign's king.
+        /// Packed with `liquidity` so its first update rewrites a non-zero slot.
+        uint64 settledReign;
         uint256 ethFees;
         uint256 tokenFees;
         uint64 lastFailureBlock;
@@ -70,6 +77,11 @@ contract PadLiquidity is IUnlockCallback {
     uint64 public lastBurnAt;
     uint256 public distributeCursor;
     uint256 public totalBurnedEth;
+    /// @notice Number of crown changes settled so far. Reign r is the time between settlement r and
+    /// settlement r + 1; reign 0 runs from deployment (no king, then the first king) to the first change.
+    uint256 public reign;
+    /// @notice The king whose reign each settlement closed; set when `settleCrown` runs.
+    mapping(uint256 => address) public reignKing;
     bool private locked;
     bool private claimLocked;
 
@@ -171,7 +183,7 @@ contract PadLiquidity is IUnlockCallback {
         bytes memory res = poolManager.unlock(abi.encode(ACT_ADD, key, l, msg.value, tokenAmount));
         (uint256 usedEth, uint256 usedTok) = abi.decode(res, (uint256, uint256));
 
-        pools.push(Pool(launchId, token, uint128(l), 0, 0, 0, 0));
+        pools.push(Pool(launchId, token, uint128(l), uint64(reign), 0, 0, 0, 0));
         poolIndexOf[launchId] = pools.length;
         IPadToken(token).unlock();
         uint256 excess = IPadToken(token).balanceOf(address(this));
@@ -195,11 +207,14 @@ contract PadLiquidity is IUnlockCallback {
         _distribute(n, false);
     }
 
-    /// @notice Atomic pre-crown batch: an unflagged collection failure vetoes the bid.
-    /// Failed bids revert their failure counters too; use distribute/retryPool to diagnose a pool.
+    /// @notice Atomic pre-crown batch: walks every pool from the cursor while the forwarded gas fits
+    /// another collection, at least MIN_CROWN_POOLS of them, and an unflagged collection failure
+    /// vetoes the bid. Pools it does not reach keep their entitlement: their next collection, by
+    /// anyone, pays the outgoing king. Failed bids revert their failure counters too; use
+    /// distribute/retryPool to diagnose a pool.
     function settleCrown() external guard {
         require(msg.sender == king, "not king");
-        _distribute(MAX_DISTRIBUTE_POOLS, true);
+        _distribute(type(uint256).max, true);
     }
 
     function _distribute(uint256 n, bool strict) internal {
@@ -207,13 +222,22 @@ contract PadLiquidity is IUnlockCallback {
         address k = IKingView(king).king();
         uint256 count = pools.length;
         if (k == address(0) || count == 0 || n == 0) return;
-        if (n > MAX_DISTRIBUTE_POOLS) n = MAX_DISTRIBUTE_POOLS;
-        if (n > count) n = count;
+        uint256 floor;
+        if (strict) {
+            // Close the outgoing king's reign: pools this walk does not reach stay owed to it.
+            reignKing[reign] = k;
+            reign += 1;
+            n = count;
+            floor = count < MIN_CROWN_POOLS ? count : MIN_CROWN_POOLS;
+        } else {
+            if (n > MAX_DISTRIBUTE_POOLS) n = MAX_DISTRIBUTE_POOLS;
+            if (n > count) n = count;
+        }
         for (uint256 i; i < n; ++i) {
             uint256 idx = distributeCursor % count;
             if (pools[idx].failures < BROKEN_FAILURES) {
                 if (gasleft() < COLLECT_GAS + COLLECTION_RESERVE_GAS) {
-                    require(!strict, "collection gas");
+                    require(i >= floor, "collection gas");
                     break;
                 }
                 bool ok = _collect(idx, k);
@@ -232,9 +256,14 @@ contract PadLiquidity is IUnlockCallback {
         return _collect(idx, k);
     }
 
+    /// @dev Pays the current king, unless the pool still holds fees of an earlier reign it was never
+    /// settled for (not reached by that crown's walk, or broken then), in which case that reign's king.
     function _collect(uint256 idx, address k) internal returns (bool) {
         Pool storage p = pools[idx];
-        try this.collectPool{gas: COLLECT_GAS}(idx, k) {
+        uint256 settled = p.settledReign;
+        address payee = settled < reign ? reignKing[settled] : k;
+        try this.collectPool{gas: COLLECT_GAS}(idx, payee) {
+            if (settled < reign) p.settledReign = uint64(reign);
             if (p.failures != 0) {
                 p.failures = 0;
                 p.lastFailureBlock = 0;

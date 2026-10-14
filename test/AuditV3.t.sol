@@ -143,7 +143,9 @@ contract AuditV3KingTest is BaseTest {
         vm.prank(players[10]);
         assertTrue(liq.retryPool(0));
         assertEq(liq.getPool(0).failures, 0);
-        assertApproxEqAbs(pvpToken.balanceOf(players[9]), 2_000_000 ether, 1);
+        // The pool was skipped at the crown, so it stays owed to the king whose reign earned its fees.
+        assertApproxEqAbs(pvpToken.balanceOf(players[8]), 2_000_000 ether, 1);
+        assertEq(pvpToken.balanceOf(players[9]), 0);
         // A fresh failure after recovery starts a new sequence.
         vm.mockCallRevert(address(pm), abi.encodeWithSelector(IPoolManager.unlock.selector), bytes("new failure"));
         liq.retryPool(0);

@@ -25,7 +25,7 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
 | External finding | v3 fix | Main regression evidence |
 |---|---|---|
 | 1, High: crown inside v4 unlock | `takeCrown` and both distribution paths read `Lock.IS_UNLOCKED_SLOT` through `exttload`. Every failure in an unflagged pre-crown pool aborts the bid. EIP-150-aware gas precondition precedes settlement. | `AuditV3KingTest.test_unlockCallbackCannotTakeCrownOrDistribute`, `test_firstCrownAlsoRejectsUnlockedManager`, `test_gasStarvedBidRevertsWithoutChangingCrownOrPoolHealth`; real v4 callbacks |
-| 3, Medium: outgoing king loses token fees | All collected tokens transfer to the king captured before collection; ETH uses a 30k push and claimable fallback. No fee-sale swap, `SELL_CHUNK`, stash or king escrow. No collection before first crown. Sixteen pools fit the measured 5M batch stipend. | `test_outgoingKingGetsLargeTokenFeesInKindAndNextKingGetsNoStash`, `test_sixteenPoolsBothCurrenciesAndGasEatingKingFitSettlementBudget`; real trading and 18-pool tests in `LiquidityV4.t.sol` |
+| 3, Medium: outgoing king loses token fees | All collected tokens transfer to the king captured before collection; ETH uses a 30k push and claimable fallback. No fee-sale swap, `SELL_CHUNK`, stash or king escrow. No collection before first crown. The pre-crown walk covers every pool the bid's gas fits (at least 16, else the bid reverts); pools it does not reach stay owed to the outgoing king through the reign stamp (#29). | `test_outgoingKingGetsLargeTokenFeesInKindAndNextKingGetsNoStash`, `test_sixteenPoolsBothCurrenciesAndGasEatingKingFitSettlementBudget`; real trading and 18-pool tests in `LiquidityV4.t.sol`; `CrownSettlementTest` (18, 40 and 60 real pools) |
 | 2, Medium: 60-second rollers expire at 10 blocks/s | 90/7/2/1 split, 1% reserved per roll and credited to the resolver, including the caller forwarded through upkeep. Expired tip goes to the roll pot and the height penalty remains. At most 16 records examined per call, with a gas floor. | `AuditV3GameTest.test_tenBlocksPerSecondSixtySecondRollerNeverExpiresWithResolver`, `test_nonGenesisSplitAndExpiredTipGoesToPotWithPenalty`, `test_resolveBatchClampsToSixteenAndLowGasStopsSafely` |
 | 4, Low: sole caller repeatedly re-rolls seed | First commit never changes. At commit+258 or later, uncaptured seed is `keccak256(abi.encode(game, commitBlock, entryCount))`. First entry fee pays one seed-capture bounty; all other entry fees burn. | `RaffleTest.test_lapsedCommitFallsBackOnceAndNeverRecommits`; direct, rejecting-recipient and upkeep bounty tests in `AuditV3GameTest` |
 | 5, Low: upkeep starves entry/roll | Explicit caps on each game step, distribution and burn; each checks cap + EIP-150 margin + caller reserve before starting. | `AuditV3CarryUpkeepTest.test_ownGasEstimateEntryAndRollWithForeignDraw`, `...Finalize`, `...Graduate`, `test_upkeepSubcallCanExhaustItsFullStipendWithoutRevertingEntry` |
@@ -143,9 +143,11 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
     graduates, so the protection no longer rests on the 30k push gas cap alone.
 21. **Outgoing king fees and pool liveness.** `takeCrown` rejects an unlocked manager, using
     the exact transient slot from vendored `Lock.sol`, and requires 5M + 5M/63 + 600k gas before
-    calling `settleCrown`. The strict path is king-only and collects the next min(16,poolCount)
-    indexes before updating king. Each self-call gets 300k. Any unflagged collection failure,
-    distributor error, guard failure or OOG reverts the entire bid and its partial settlements.
+    calling `settleCrown` with every unit of gas above the 600k reserve. The strict path is
+    king-only and walks every pool from the cursor while gas fits another collection, at least
+    min(16, poolCount) of them, before updating king (#29). Each self-call gets 300k. Any unflagged
+    collection failure, distributor error, guard failure or OOG reverts the entire bid and its
+    partial settlements.
     Ordinary `distribute` is permissionless and records failures without reverting successful
     pools. It checks the whole stipend plus 100k before each attempt, so gas starvation cannot
     manufacture a failure. Three failures in distinct ArbSys L2 blocks mark a pool broken; repeat
@@ -157,10 +159,10 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
     The previous claim-reentry fix is retained: claims never hold the pool guard, and the original
     adversarial callback test still pays the outgoing king. Both currencies, 16 pools and a king
     exhausting every ETH push are measured in the new real-manager regression.
-    Limits: more than 16 pools, explicitly broken pools, and newly earned post-settlement fees can
-    pay a later king. There is no unbounded historical entitlement checkpoint. A broken pool may
-    remain broken indefinitely; monitor PoolHealth and retry. This is the requested liveness
-    exception, not a guarantee that every historical fee is paid.
+    Limits: pools the walk does not reach and explicitly broken pools are paid later, to the king
+    of the reign they are stamped with (#29), not to the next king. A broken pool may remain
+    broken indefinitely; monitor PoolHealth and retry. This is the requested liveness exception,
+    not a guarantee that every historical fee is paid promptly.
 22. **Paid Sybil entry remains possible; speed no longer buys seats.** No EOA checks, one entry per
     wallet, no cap on wallets. Every entry costs 0.001 ETH, including unselected wallets. For H honest
     and B bot entries, let N=H+B and S=min(N,200). Bot seats follow Hypergeometric(N,B,S), with mean
@@ -230,6 +232,46 @@ broadcast, RPC, fork, wallet, environment-reading test, or outside constructor c
     `entryOf`, `impOf` and `myEntry` (revision finding 9ce6a613). `SQRT_MIN_FULL` / `SQRT_MAX_FULL`
     now equal `TickMath.getSqrtPriceAtTick(±887200)` of the vendored v4-core and are asserted against
     it (finding 561f5bd6); the earlier off-by-one values were covered by the 1 ppm haircut.
+29. **Reign-stamped fee entitlement (revision finding 8b022036, medium).** The previous strict
+    batch clamped the pre-crown settlement to 16 indexes before looking at gas, and `takeCrown`'s
+    trailing `upkeepFor` then ran `distribute(2)` for the new king, so with 17 or more pools the
+    bidder received the fees of the pools the batch skipped inside its own bid, and could choose
+    them by moving the public cursor with `distribute(1)` first. The reviewer's proof reproduced on
+    the previous tree (bidder gained 0.1 ETH of the old reign's fees in the bid transaction). Fix,
+    in `PadLiquidity`: (a) `settleCrown` sets `n = poolCount` and keeps collecting while
+    `gasleft() >= 300k + 100k`, reverting `collection gas` only if fewer than min(16, poolCount)
+    pools were visited, and `takeCrown` forwards everything above its 600k reserve instead of a
+    fixed 5M, so a bid can settle more pools by sending more gas; (b) each settlement records the
+    outgoing king in `reignKing[reign]` and increments `reign`; each pool carries `settledReign`,
+    stamped at graduation and on every successful collection; a collection of a pool whose stamp is
+    below `reign` pays `reignKing[stamp]`, the king of the earliest reign the pool was never settled
+    for, and then stamps the current reign. Pools skipped for gas or because they were broken are
+    therefore paid to the old king by whoever collects them next (including the bid's own trailing
+    upkeep), and the bidder can neither starve the walk below 16 nor pick which pools fall outside
+    it. Accepted imprecision: such a pool's fees earned after the crown change and before its next
+    collection also go to the earlier king; the new king controls that by collecting promptly.
+    Also, the first crown closes no reign, so fees accrued before any king go to the first king as
+    before. Gas: the stamp is packed beside `liquidity`, so its update rewrites a non-zero slot; the
+    minimum stipend settles about 40 real pools locally and 60 need about 7.6M. To keep the
+    deployment under the 13M target, ten PadLiquidity constants that no contract or test reads
+    became `internal` (values unchanged, listed in the README). Tests: `CrownSettlementTest`
+    (the reviewer's cursor-steering scenario on 18 real pools, 60 pools with a minimum-gas bid and
+    with a generous bid, the 16-pool floor revert, non-king settlement, first-crown reign, a broken
+    pool skipped by two crowns paid to the earliest reign), and the updated 18-pool and
+    broken-pool tests in `LiquidityV4Test` and `AuditV3KingTest`.
+30. **Fallback seed and the commit block (revision finding 779d74d2, low, disputed).** The
+    lapsed-window seed is `keccak256(abi.encode(game, commitBlock, entryCount))`, exactly the
+    formula the brief prescribes for Fix 4. The reviewer notes that the first `draw()` caller
+    chooses the commit block and can therefore pre-compute the fallback seating for candidate
+    blocks, then let the hash window lapse. That is correct and already disclosed in #23 (the
+    fallback is predictable; a sole keeper chooses between timely capture and the one known
+    fallback). It is not changed here: the formula is the requested one; any replacement input
+    available at commit time (an earlier block hash, the signup-end block) is equally observable
+    or steerable by whoever sends the first post-signup call; the attack needs the attacker to be
+    the first committer, 201 paid wallets, and a pad on which nobody else calls `draw`, `poke` or
+    any upkeep for the whole 26-second window; and below 200 entries the seed only orders seats,
+    the last tie-break key. Anyone, including the would-be victim, can commit first and capture the
+    seed. Operators should run an independent seed-capture keeper (README, after launch).
 
 ## Edges covered by tests and known gaps
 
@@ -240,7 +282,8 @@ resolution timing, expiry, own-previous-roll resolution, batch of 16, bell, deat
 50-minute play cap, ranking with ties and triangular weights, bell share, finalizer fee cap,
 claimable fallback, ETH conservation, graduation (pool, unlock, burn excess, price), failed
 graduation, upkeep-driven finalize/graduate, king bid rules, king split, live-game weighting,
-refund claimable, in-kind distribution and pre-crown atomicity, burn chunk cap and interval, paid failed genesis
+refund claimable, in-kind distribution and pre-crown atomicity, reign-stamped entitlement of unreached and broken pools,
+cursor steering before a bid, 16-pool settlement floor, burn chunk cap and interval, paid failed genesis
 restart (via `launch` and `restartGenesis`) through to a graduated second PvP and a burn on its
 pool, funded pot returned with fewer than five living, 3x release cap with five living, finalizer
 fee from roll income only, `fundPot` pad-only, king share weighted by roll pot, finalizer fee to

@@ -133,18 +133,28 @@ splits 50% games, 25% burn, 25% dev. Games share follows v2: last ten **entered*
 entries during signup/draw or five seats after draw, weighted by roll-earned pot (equal if all zero).
 No eligible game means carry. Free launches never displace entered games from this window.
 
-Before changing an existing king, the next **16 pool indexes** settle under a 5M gas stipend,
-300k per collection. A bid requires the full stipend plus EIP-150 margin and a 600k reserve.
-`takeCrown` and `distribute` reject an already-unlocked PoolManager via the vendored Lock transient
-slot read through `exttload`. Any failure in an unflagged pool aborts the bid. Permissionless normal
-collection records failures instead; after three failures in distinct L2 blocks a pool is skipped
-as broken until a successful `retryPool` clears its flag. A gas-starved probe cannot mark it broken.
+Before changing an existing king, the pre-crown settlement walks **every pool** from the public
+cursor while the bid's gas still fits another collection (300k per self-call plus a 100k reserve),
+and must reach at least **16 pools** or the bid reverts. A bid requires at least the 5M minimum
+stipend plus EIP-150 margin and a 600k reserve; everything above the reserve is forwarded, so a bid
+sent with more gas settles more pools (the minimum fits about 40 real pools locally; 60 pools need
+about 7.6M). `takeCrown` and `distribute` reject an already-unlocked PoolManager via the vendored
+Lock transient slot read through `exttload`. Any failure in an unflagged pool aborts the bid.
+Permissionless normal collection records failures instead; after three failures in distinct L2
+blocks a pool is skipped as broken until a successful `retryPool` clears its flag. A gas-starved
+probe cannot mark it broken.
 
-Collected **ETH and tokens are paid in kind** to the king captured for that batch. ETH has a 30k
-push cap and claimable fallback; tokens use plain transfer. There is no fee sale, token stash,
+Collected **ETH and tokens are paid in kind** to the king each pool is owed to. ETH has a 30k push
+cap and claimable fallback; tokens use plain transfer. There is no fee sale, token stash,
 `SELL_CHUNK` or king escrow. Before the first crown, collection does nothing and fees accrue in LP
-positions. Pools beyond the 16-index batch, explicitly broken pools and fees earned afterward can
-pay a later king; this bounded design does not checkpoint an unlimited historical entitlement.
+positions; the first king collects them. Each settlement closes a **reign**: PadLiquidity records
+the outgoing king as `reignKing[reign]` and bumps `reign`; every pool stores the reign it is
+settled for. A pool the walk did not reach (gas ran out after the 16-pool floor, or the pool was
+flagged broken) keeps the old reign stamp, and its next collection, by anyone, pays that reign's
+king rather than the new one. So nothing earned under a reign can be collected by the next king,
+whatever the pool count or the public cursor position. The one imprecision runs the other way: fees
+such a pool earns between the crown change and its next collection also go to the earlier king,
+which the new king avoids by collecting promptly (or by sending the bid with enough gas).
 
 Burn-bucket buys still use at most 0.02 ETH per ten minutes, pay PVP directly to `0x…dEaD`, and stop
 at a 0.5% sqrt-price move (about 1% in price). Unspent ETH stays in the bucket. This bounds each buy's
@@ -156,7 +166,8 @@ impact but is not a guarantee against MEV or manipulation.
 |---|---|
 | Draw | 32 trials, at most 200 seats |
 | Roll resolution | 16 examined records, including already resolved records; 200k gas floor |
-| Crown settlement | 16 indexes, 300k each, 5M total stipend; 600k outer reserve + EIP-150 margin |
+| Crown settlement | every pool while gas fits, at least 16; 300k each + 100k reserve; 5M minimum stipend, all surplus forwarded; 600k outer reserve + EIP-150 margin |
+| Public distribute(n) | at most 16 pools per call; unreached or broken pools pay the reign's recorded king |
 | Collection health probe | Whole 300k stipend + 100k reserve required |
 | Pad game upkeep step | 4.5M per call; latest entered game plus one older round-robin game |
 | Pad distribute(2) / burnChunk | 750k / 350k |
