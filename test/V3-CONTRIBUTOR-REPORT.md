@@ -3,21 +3,34 @@
 Verification date: 2026-10-14. Foundry 1.8.3, Solidity 0.8.26, Cancun, optimizer 200,
 via-IR, and the inherited metadata settings.
 
-The complete suite passes: **186 tests, zero failures, zero skips, across 19 suites**.
+The complete suite passes: **193 tests, zero failures, zero skips, across 20 suites**.
 `forge build`, formatting checks on the added Solidity files, and the existing offline
 manifest validator pass. Existing compiler lint warnings remain; this is not a claim of
 a warning-free security analysis. No additional implementation defect was reproduced.
 
 This contribution adds ten regression/property tests and two invariant campaigns checking
-four properties. The original 174 tests, real v4-core implementation, application sources,
+four properties. The other 181 tests, real v4-core implementation, application sources,
 manifest, dependencies, configuration, and existing documentation are preserved. All
 deliverable changes are under `test/`; no dependencies were added.
+
+Revision note (2026-10-14): after this contribution was first accepted, the implementation
+adopted reign-stamped settlement (`docs/AUDIT.md` item 29): a pool that a crown change does
+not settle, because it was flagged broken or because the bid's gas did not reach it, pays the
+king of the earliest reign it was never settled for on its next collection, then takes the
+current reign's stamp. One retained test asserted the earlier behaviour (the bidder received a
+broken pool's fees on retry) and failed against the revised sources. It now asserts the
+documented semantics: the retry pays the outgoing king both currencies in kind, the bidder
+receives nothing from that reign, the pool is stamped with the new reign, and fees earned
+afterwards go to the new king only. The accepted imprecision recorded in item 29 (fees a
+skipped pool earns between the crown change and its next collection also reach the earlier
+king) is a documented design choice, not asserted as a defect here; the new king limits it
+by collecting promptly.
 
 ## Added coverage
 
 | File | Assertions and failure paths |
 |---|---|
-| `V3FailureEdges.t.sol` / `V3PoolFailureEdgesTest` | A token transfer returning false rolls back both fee currencies and vetoes a crown change; a successful retry clears failure history; three new failures must occur in distinct L2 blocks; permissionless recovery after a pool is flagged; retry inside an actual PoolManager unlock reverts without corrupting health; unauthorized strict settlement and an invalid pool index revert. |
+| `V3FailureEdges.t.sol` / `V3PoolFailureEdgesTest` | A token transfer returning false rolls back both fee currencies and vetoes a crown change; a successful retry clears failure history; three new failures must occur in distinct L2 blocks; a pool flagged broken does not veto the next bid, stays stamped with the outgoing reign, and its permissionless recovery pays the outgoing king both currencies in kind while the bidder gets nothing from that reign and everything earned afterwards; retry inside an actual PoolManager unlock reverts without corrupting health; unauthorized strict settlement and an invalid pool index revert. |
 | `V3FailureEdges.t.sol` / `V3GameFailureEdgesTest` | Resolver accounting over hash-window offsets 0–350; settled rolls cannot pay another resolver; bounty callback reentrancy cannot capture twice or enlarge a draw chunk; resolver debt survives finalization and real v4 graduation; rejected claims preserve debt; a finalization with too many pending rolls rolls back partial resolution and tips, then succeeds after permissionless progress; both optional liquidity upkeep calls may exhaust their entire gas caps without reverting entry or roll. |
 | `V3CarryProperties.t.sol` | Public carry donations, actual crown funding, and paid rolls with zero through six survivors. Drawing never pulls carry. Finalization pulls exactly the available unused allowance, at most once. Existing funding consumes the allowance first. The release cap obeys both 3x earned pot and 15% of curve ETH. Beneficiary receipts plus returned carry conserve the entire pot, including rounding dust. Repeated finalization cannot pull again. |
 | `V3ResolverInvariant.t.sol` | Six recipients, paid play, time advancement, direct resolution with ordinary or constrained gas, and accepting/rejecting claims in random order. Each tip is pending, expired into the pot, or owed/paid to its actual resolver. Settled roll records are immutable. Game ETH, curve proceeds, burn funding, and token supply reconcile independently. Every sequence ends by resolving, claiming, finalizing, and graduating, with no game ETH or tokens stranded. |
@@ -51,8 +64,8 @@ additional evidence without changing those application documents.
 
 | Requested fix | Retained proof coverage | Added evidence |
 |---|---|---|
-| 1. Strict king settlement | `AuditV3KingTest`: nested real unlock, insufficient gas, atomic rollback, three-block diagnosis and recovery | Token-transfer failure rollback; nested retry lock check; failure-history reset; randomized gas-starved bids and debt accounting |
-| 2. King fees in kind | `LiquidityV4Test`, `KingTest`, `AuditV3KingTest`: no collection before first crown, real swap fees, outgoing king payment, sixteen-pool gas budget | Per-reign ETH/token reconciliation across random bids, donations, rejected pushes, and claims |
+| 1. Strict king settlement | `AuditV3KingTest`, `CrownSettlementTest`: nested real unlock, insufficient gas, atomic rollback, three-block diagnosis and recovery, reign-stamped entitlement of unreached and broken pools | Token-transfer failure rollback; nested retry lock check; failure-history reset; a broken pool skipped by a bid still pays the outgoing king on recovery; randomized gas-starved bids and debt accounting |
+| 2. King fees in kind | `LiquidityV4Test`, `KingTest`, `AuditV3KingTest`, `CrownSettlementTest`: no collection before first crown, real swap fees, outgoing king payment, sixteen-pool floor and gas-extended walks | Per-reign ETH/token reconciliation across random bids, donations, rejected pushes, and claims |
 | 3. Resolver incentive and expiry | `AuditV3GameTest`: 60-second roller at ten L2 blocks/second, direct/upkeep beneficiaries, split, expiry penalty, sixteen-record limit | Every hash-window region, double-resolution resistance, debt across graduation, failed-finalization rollback, and resolver accounting invariants |
 | 4. Binding draw seed and bounty | `RaffleTest`, `AuditV3GameTest`: deterministic fallback, unchanged commit, chunk/caller independence, one-time bounty | A bounty recipient attempts a second draw during its ETH callback; it cannot receive twice or advance extra seats |
 | 5. Upkeep gas isolation | `AuditV3CarryUpkeepTest`: own-action estimates with foreign draw/finalize/graduate work, full game-step exhaustion | Distribution and burn each exhaust their explicit gas cap during both entry and roll; both user actions still succeed |
@@ -62,10 +75,10 @@ additional evidence without changing those application documents.
 
 | Operation | Gas |
 |---|---:|
-| Atomic raw-CREATE2 application deployment, including calldata and intrinsic | 12,195,652 |
-| Later `openPad`, including hook and genesis clones | 786,466 |
-| Combined deployment and later opening | **12,982,118** |
-| Crown transition, sixteen real pools, both fee currencies, outgoing king exhausts ETH pushes | 4,568,783 |
+| Atomic raw-CREATE2 application deployment, including calldata and intrinsic | 12,188,501 |
+| Later `openPad`, including hook and genesis clones | 786,290 |
+| Combined deployment and later opening | **12,974,791** |
+| Crown transition, sixteen real pools, both fee currencies, outgoing king exhausts ETH pushes | 4,698,427 |
 | Entry while both optional liquidity upkeep stipends are exhausted | 1,353,887 |
 | Roll while both optional liquidity upkeep stipends are exhausted | 1,428,275 |
 | Entry call limit from retained own-action estimation tests | 185,039 |
@@ -83,7 +96,7 @@ excludes deployment-service-specific wrapper overhead, as documented in the reta
 Manifest validation confirms the original five-contract order, string constructor arguments,
 backward references, lowercase static addresses, no unresolved links, nonpayable constructors,
 initcode/runtime bounds, forbidden-opcode checks, `bytecode_hash = "none"`, and
-`cbor_metadata = false`. Runtime sizes remain 3,210 / 18,665 / 11,790 / 13,853 / 3,123 bytes
+`cbor_metadata = false`. Runtime sizes are 3,210 / 18,665 / 11,790 / 13,808 / 3,138 bytes
 for PadToken / PadGame / PvPPad / PadLiquidity / KingOfThePad respectively, all below 24,576.
 
 ## Reproduction and limits
@@ -96,10 +109,9 @@ FOUNDRY_FUZZ_SEED=0x1e572fb3fcde0b288122efe0d6a70e987a222567a2ac5cd3bc7883ffbf29
   forge test --out test/scratch/out --cache-path test/scratch/cache -vv
 ```
 
-The existing manifest validator was executed unchanged in memory except for redirecting its
-artifact lookup from `out/` to `test/scratch/out/`. With the normal Foundry output location,
-the equivalent checks are `forge build`, `forge test`, and
-`python3 tools/validate_manifest.py`. Inline fuzz/invariant settings travel with the tests;
+The revision run used the normal Foundry output location: `forge build`, `forge test` with
+the assignment seed above, `forge fmt --check` on the added files, and
+`python3 -I tools/validate_manifest.py`. Inline fuzz/invariant settings travel with the tests;
 no configuration edits or environment-setting cheatcodes are required.
 
 The twelve added tests also pass with the inherited configuration seed

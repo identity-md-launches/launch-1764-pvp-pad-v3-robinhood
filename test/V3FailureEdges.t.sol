@@ -131,13 +131,37 @@ contract V3PoolFailureEdgesTest is BaseTest {
         vm.prank(players[9]);
         king.takeCrown{value: 0.011 ether}();
         assertEq(king.king(), players[9]);
-        assertEq(liq.getPool(0).failures, 3);
+        assertEq(liq.getPool(0).failures, 3, "a broken pool must not veto the bid");
+        assertEq(liq.reign(), 1);
+        assertEq(liq.reignKing(0), players[8]);
+        assertEq(liq.getPool(0).settledReign, 0, "the broken pool stays stamped with the outgoing reign");
         vm.clearMockedCalls();
-        uint256 balance = pvpToken.balanceOf(players[9]);
+        // The pool was never settled for reign 0, so its retry pays the outgoing king in kind, not the
+        // bidder (AUDIT.md #29); the token transfer that failed three times now succeeds.
+        uint256 oldKingTokens = pvpToken.balanceOf(players[8]);
+        uint256 oldKingETH = players[8].balance;
+        uint256 newKingTokens = pvpToken.balanceOf(players[9]);
+        uint256 newKingETH = players[9].balance;
         vm.prank(players[11]);
         assertTrue(liq.retryPool(0));
-        assertApproxEqAbs(pvpToken.balanceOf(players[9]) - balance, 100 ether, 1);
+        assertApproxEqAbs(pvpToken.balanceOf(players[8]) - oldKingTokens, 100 ether, 1, "outgoing king's tokens");
+        // The donation plus the genesis pool's real swap fees from the bid's own burn buy.
+        assertGe(players[8].balance - oldKingETH, 0.01 ether - 1, "outgoing king's ETH");
+        assertLt(players[8].balance - oldKingETH, 0.011 ether, "outgoing king's ETH");
+        assertEq(pvpToken.balanceOf(players[9]), newKingTokens, "bidder must not take the old reign's tokens");
+        assertEq(players[9].balance, newKingETH, "bidder must not take the old reign's ETH");
         assertEq(liq.getPool(0).failures, 0);
+        assertEq(liq.getPool(0).lastFailureBlock, 0);
+        assertEq(liq.getPool(0).settledReign, 1, "recovery stamps the current reign");
+        // Fees earned from now on belong to the new king; the earlier king gets nothing more.
+        donateFees(liq.poolKey(address(pvpToken)), 0.005 ether, 50 ether);
+        oldKingTokens = pvpToken.balanceOf(players[8]);
+        oldKingETH = players[8].balance;
+        assertTrue(liq.retryPool(0));
+        assertApproxEqAbs(pvpToken.balanceOf(players[9]) - newKingTokens, 50 ether, 1);
+        assertApproxEqAbs(players[9].balance - newKingETH, 0.005 ether, 1);
+        assertEq(pvpToken.balanceOf(players[8]), oldKingTokens);
+        assertEq(players[8].balance, oldKingETH);
     }
 
     function test_retryInsideRealManagerUnlockCannotDiagnoseHealthyPoolAsBroken() public {
